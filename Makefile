@@ -4,10 +4,11 @@ LDFLAGS=
 
 all: proja
 
-proja: proja.c
+proja: router.o tun.o log.o
+	$(CC) $^ $(LDFLAGS) -o $@
 
-.c:
-	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
+%.o: %.c
+	$(CC) -c -o $@ $< $(CFLAGS)
 clean:
 	rm -f proja *.o
 

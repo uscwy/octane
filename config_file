@@ -2,6 +2,5 @@
           #d
 
 #config
-num_routers 	2adsfasdf
- stage 1
-	#num_routers 200
+num_routers 	1
+stage 2
