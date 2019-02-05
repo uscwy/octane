@@ -6,11 +6,11 @@ tun as input/output interface.
 
 The primary router waits on both tun interface and UDP port to receive
 packet from tun interface and secondary router.
-The primary router waits only on UDP port to receive message from primary
+The secondary router waits only on UDP port to receive message from primary
 router.
 
 Topology:
-                Tunnel                    UDP
+              IP Tunnel                   UDP
 tun interface <-------> primary router <--------> secondary router
 
 
