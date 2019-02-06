@@ -179,8 +179,8 @@ void packet_input(char *p, int len, struct sockaddr_in *s) {
 		ip->ip_dst = tmp;
 		icmp->icmp_type = ICMP_ECHOREPLY;
 		icmp->icmp_cksum = 0;
-		icmp->icmp_cksum = htons(checksum((char *)icmp, 
-					sizeof(struct icmphdr)));
+        icmp->icmp_code = 0;
+		icmp->icmp_cksum = (checksum((char *)icmp, 64));
 		pkg->op=htonl(OP_PACKET);
 		memcpy(pkg->data, p, len);
 		sendto(sockfd, buf, HDR_LEN+len, 0,
