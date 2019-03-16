@@ -11,7 +11,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
-
+#include <sys/timerfd.h>
 #include "octane.h"
 #include "log.h"
 #include "tun.h"
@@ -21,9 +21,13 @@ struct config conf;
 int stage;
 int num_routers;
 int rid; /*router id*/
-int sockfd, tunfd;
+int sockfd, tunfd, rawsockfd, timerfd;
 struct sockaddr_in addrs[MAX_ROUTERS];
 char buf[BUF_LEN];
+struct in_addr srcip;
+struct flow_entry flow_table[MAX_FLOW_ENTRY];
+int entry_num;
+struct timer *timer_queue;
 
 /*read item from conf*/
 int get_conf(const char *name, int *val) {
@@ -48,7 +52,7 @@ int add_conf(const char *name, int val) {
 
 /*read configure file into conf*/
 int read_config(const char *fn) {
-        FILE *fp;
+    FILE *fp;
 	unsigned int i, value;
 	const int maxlen=512;
 	char buf[maxlen+1];
@@ -154,7 +158,94 @@ unsigned short checksum(char *addr, short count)
 
        return (unsigned short) ~sum;
 }
+uint32_t get_router_internal_ip() {
+    uint32_t addr = inet_addr(SECOND_ROUTER_INT_IP);
+    addr = ntohl(addr) + rid - 1;
+    return htonl(addr);
+}
+/*add rule to flow table, offset=0 from the beginning, offset=-1 from the last*/
+void rule_install(struct flow_entry *f, int offset) { 
+    int i,begin,end,step;
 
+    if(offset < 0) {
+        begin = MAX_FLOW_ENTRY;
+        end = 0;
+        step = -1;
+    }
+    else {
+        begin = 0;
+        end = MAX_FLOW_ENTRY;
+        step = 1;
+    }
+    for(i=begin;i!=end;i=i+step) {
+        if(flow_table[i].action == FLOW_ACT_UNUSED) {
+            flow_table[i] = *f;
+            break;
+        }
+    }
+}
+int is_flow_match(struct flow_entry *f1, struct flow_entry *f2) {
+    if(f1->src != f2->src && f1->src != 0xffffffff)
+        return 0;
+    if(f1->dst != f2->dst && f1->dst != 0xffffffff)
+        return 0;
+    if(f1->sport != f2->sport && f1->sport != 0xffff)
+        return 0;
+    if(f1->dport != f2->dport && f1->dport != 0xffff)
+        return 0;
+    if(f1->proto != f2->proto && f1->proto != 0xffff)
+        return 0;
+
+    return 1;
+}
+struct flow_entry *find_flow_entry(struct flow_entry *f) {
+    for(int i=0;i<MAX_FLOW_ENTRY;i++) {
+        if(is_flow_match(&flow_table[i], f) == 1)
+            return &flow_table[i];
+    }
+    return NULL;
+}
+char *flow_to_str(struct flow_entry *f) {
+    static char str[256];
+    char src[32];
+    char dst[32];
+    struct in_addr s,d;
+    s.s_addr = f->src;
+    d.s_addr = f->dst;
+    strcpy(src,inet_ntoa(s));
+    strcpy(dst,inet_ntoa(d));
+    sprintf(str,"(%s, %d, %s, %d, %d) action %d", src,
+            ntohs(f->sport), dst, ntohs(f->dport), f->proto, ntohs(f->action));
+    return str;
+}
+void add_default_rule() {
+    struct flow_entry f;
+    f.action = FLOW_ACT_DROP;
+    f.src = 0xffffffff;
+    f.dst = f.src;
+    f.sport = 0xffff;
+    f.dport = f.sport;
+    f.proto = 0xff;
+    f.port = 0xffff;
+    rule_install(&f, rid);
+}
+int rawsocket_send(void *p, long len) {
+            struct iovec iov[1];
+            iov[0].iov_base = p;
+            iov[0].iov_len = len;
+            /*srcip = ip->ip_src;*/
+            struct msghdr msg;
+            struct sockaddr_in inaddr;
+            memset(&inaddr, 0, sizeof(inaddr));
+            memset(&msg, 0, sizeof(msg));
+            /*inaddr.sin_addr = ip->ip_dst;*/
+            msg.msg_name = &inaddr;
+            msg.msg_namelen = sizeof(inaddr);
+            msg.msg_iov = &iov[0];
+            msg.msg_iovlen = 1;
+            /*send to raw socket*/
+            return sendmsg(rawsockfd, &msg, 0);
+}
 /*packet handler*/
 void packet_input(char *p, int len, struct sockaddr_in *s) {
 	struct ip *ip=(struct ip *)p;
@@ -162,39 +253,66 @@ void packet_input(char *p, int len, struct sockaddr_in *s) {
 	struct icmp *icmp=(struct icmp *)(ip+1);
 	char from[64],ipsrc[32];
 
-	if(ip->ip_p!=IPPROTO_ICMP) return;
 
 	if(s==NULL) strcpy(from,"tunnel");
 	else sprintf(from,"port %d",ntohs(s->sin_port));
 	
-	strcpy(ipsrc, inet_ntoa(ip->ip_src));
 
-	log_print("ICMP from %s, src: %s, dst: %s, type: %d\n",
-		from, ipsrc, inet_ntoa(ip->ip_dst),
-		icmp->icmp_type);
+	if(ip->ip_p==IPPROTO_ICMP) {
+	    strcpy(ipsrc, inet_ntoa(ip->ip_src));
+	    log_print("ICMP from %s, src: %s, dst: %s, type: %d\n",
+		    from, ipsrc, inet_ntoa(ip->ip_dst),
+		    icmp->icmp_type);
+    }
 	
-	if(rid!=0) {
-		struct in_addr tmp = ip->ip_src;
-		ip->ip_src = ip->ip_dst;
-		ip->ip_dst = tmp;
-		icmp->icmp_type = ICMP_ECHOREPLY;
-		icmp->icmp_cksum = 0;
+    struct flow_entry f,*flow;
+    f.src = ip->ip_src.s_addr;
+    f.dst = ip->ip_dst.s_addr;
+    f.proto = ip->ip_p;
+    f.sport = 0xffff;
+    f.dport = 0xffff;
+    if(ip->ip_p == IPPROTO_TCP) {
+    }
+    if(ip->ip_p == IPPROTO_UDP) {
+    }
+    flow = find_flow_entry(&f);
+    if(flow==NULL) {
+        if(rid == 0) {
+            /*primary router*/
+            f.action = FLOW_ACT_FORWARD;
+            f.port = addrs[1].sin_port;
+            rule_install(&f, 0);
+        }
+        log_print("router: %d, rule installed %s", rid, flow_to_str(&f));
+    }
+    else {
+        log_print("router: %d, rule hit %s", rid, flow_to_str(&f));
+    }
+    if(f.action == FLOW_ACT_FORWARD) {
+        if(f.port == 0) {
+            if(rid == 0) tun_write(tunfd,p,len);
+            else rawsocket_send(p, len);
+        }
+    }
+	if(f.action == FLOW_ACT_REPLY) {
+	    if(ip->ip_p!=IPPROTO_ICMP) return;
+        struct in_addr tmp = ip->ip_src;
+
+        ip->ip_src = ip->ip_dst;
+        ip->ip_dst = tmp;
+        icmp->icmp_type = ICMP_ECHOREPLY;
+        icmp->icmp_cksum = 0;
         icmp->icmp_code = 0;
-		icmp->icmp_cksum = (checksum((char *)icmp, 64));
-		pkg->op=htonl(OP_PACKET);
-		memcpy(pkg->data, p, len);
-		sendto(sockfd, buf, HDR_LEN+len, 0,
-				(struct sockaddr *)s, sizeof(*s));
-	}
-	
-	if(rid==0 && s==NULL) {
+        icmp->icmp_cksum = (checksum((char *)icmp, 64));
+        pkg->op=htonl(OP_PACKET);
+        memcpy(pkg->data, p, len);
+        sendto(sockfd, buf, HDR_LEN+len, 0,
+                (struct sockaddr *)s, sizeof(*s));
+
 		pkg->op=htonl(OP_PACKET);
 		memcpy(pkg->data, p, len);
 		sendto(sockfd, buf, HDR_LEN+len, 0,
 				(struct sockaddr *)&addrs[1], sizeof(addrs[1]));
-	}
-	if(rid==0 && s!=NULL) {
-		tun_write(tunfd,p,len);
 	}
 }
 void handle_tun() {
@@ -244,6 +362,39 @@ void handle_udp() {
 	return;
 
 }
+/*packet handler for raw socket*/
+void handle_rawsocket() {
+    struct packet *pkg = (struct packet *)buf;
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    char src[32], dst[32];
+    int len;
+    struct ip *ip = (struct ip *)pkg->data;
+	struct icmp *icmp=(struct icmp *)(ip+1);
+
+    len = recvfrom(rawsockfd, pkg->data, BUF_LEN, MSG_DONTWAIT,
+        (struct sockaddr *)&addr, &addrlen);
+
+
+    if(len < sizeof(struct ip)) {
+        return;
+    }
+
+	if(ip->ip_p!=IPPROTO_ICMP) return;
+
+    strcpy(src, inet_ntoa(ip->ip_src));
+    strcpy(dst, inet_ntoa(ip->ip_dst));
+
+	log_print("ICMP from raw sock, src: %s, dst: %s, type: %d\n",
+        src, dst, icmp->icmp_type);
+
+    ip->ip_dst = srcip;
+    icmp->icmp_cksum = (checksum((char *)icmp, 64));
+    pkg->op=htonl(OP_PACKET);
+    sendto(sockfd, buf, HDR_LEN+len, 0,
+                (struct sockaddr *)&addrs[0], sizeof(addrs[0]));
+
+}
 void send_hello() {
 	struct packet *hdr = (struct packet *)buf;
 	struct pkg_hello *hello=(struct pkg_hello *)(hdr+1);
@@ -259,6 +410,123 @@ void send_hello() {
 			htons(addrs[0].sin_port));*/
 
 }
+int raw_socket_bind() {
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    struct sockaddr_in addr;
+    char ipaddr[32];
+
+    memset(&addr, 0, sizeof(addr));
+    strcpy(ipaddr, SECOND_ROUTER_EXT_IP);
+    ipaddr[strlen(ipaddr)-1] += rid;
+    addr.sin_family = AF_INET;
+    inet_aton(ipaddr, &addr.sin_addr);
+
+    if(bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr,"bind %s error\n", ipaddr);
+    }
+    return sock;
+}
+/*return true if tv1 > tv2*/
+int time_compare(struct timespec *tv1, struct timespec *tv2) {
+    if(tv1->tv_sec > tv2->tv_sec) 
+        return 1;
+    if(tv1->tv_sec == tv2->tv_sec) {
+        if(tv1->tv_nsec > tv2->tv_nsec)
+            return 1;
+    }
+    return 0;
+}
+/**/
+void timer_dequeue(struct timer *t) {
+    if(t->next)
+        t->next->prev = t->prev;
+    if(t->prev)
+        t->prev->next = t->next;
+}
+void timer_enqueue(struct timer *t, struct timer **head) {
+    if(*head == NULL) {
+        *head = t;
+        t->prev = NULL;
+        t->next = NULL;
+        return;
+    }
+    struct timer *tmp = *head;
+    while(tmp->next != NULL) {
+        tmp = tmp->next;
+    }
+    tmp->next = t;
+    t->prev = tmp;
+    t->next = NULL;
+}
+void timer_free(struct timer *t) {
+    free(t->packet);
+    free(t);
+}
+void recv_ack(int32_t seq) {
+    struct timer *t = timer_queue;
+    while(t != NULL) {
+        struct packet *pkg = (struct packet *)t->packet;
+        struct octane_control *ctl=(struct octane_control *)pkg->data;
+        struct timer *next = t->next;
+        if(ctl->seqno == seq) {
+            timer_dequeue(t);
+            timer_free(t);
+        }
+        t = next;
+    }
+}
+struct timer *timer_resend(struct timer *t) {
+    if(t->resend > MAX_RESEND) {
+        timer_free(t);
+        return NULL;
+    }
+    t->resend++;
+    t->tv.tv_sec += TIMEOUT;
+    sendto(t->sockfd, t->packet, t->len, 0, 
+            (struct sockaddr *)&t->addr, sizeof(struct sockaddr));
+    return t;
+}
+/*timer handler*/
+void handle_timer() {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+
+    struct timer *timer = timer_queue;
+    struct timer *next;
+    struct itimerspec itm;
+
+    while(timer != NULL) {
+        if(time_compare(&timer->tv, &now)) {
+            memset(&itm, 0, sizeof(itm));
+            itm.it_value = timer->tv;
+            timerfd_settime(timerfd, TFD_TIMER_ABSTIME, &itm, NULL);
+            return;
+        }
+        next = timer->next;
+
+        timer_dequeue(timer);
+        timer = timer_resend(timer);
+        /*insert to queue*/
+        if(timer) timer_enqueue(timer, &timer_queue);
+
+        timer = next;
+    }
+}
+void timer_add(int sockfd, void *packet, int len, struct sockaddr_in *addr) {
+    void *p=malloc(len);
+    struct timer *t = malloc(sizeof(struct timer));
+    if(p==NULL || t==NULL) return;
+    t->sockfd = sockfd;
+    t->packet = p;
+    t->len = len;
+    t->addr = *addr;
+    t->resend = 0;
+    clock_gettime(CLOCK_REALTIME, &t->tv);
+    memcpy(t->packet, packet, len);
+    timer_resend(t);
+    timer_enqueue(t, &timer_queue);
+    handle_timer();
+}
 /*router process, never return*/
 int router_process() {
 	fd_set fds;
@@ -272,20 +540,33 @@ int router_process() {
 	if(stage>1 && rid == 0) {
 		tunfd = tun_alloc(tun);
 	}
+    if(stage>1 && rid > 0) {
+        rawsockfd = raw_socket_bind();
+    }
+    timerfd = timerfd_create(CLOCK_REALTIME, 0);
 	/*send hello to primary router*/
 	if(rid > 0) {
 		send_hello();
 	}
+    
+    /*install default flow entry*/
+    if(stage == 6) add_default_rule();
 
 	memset(&tv, 0, sizeof(tv));
 
 	nfd = sockfd;
-	if(tunfd > sockfd) nfd = tunfd;
+	if(tunfd > nfd) nfd = tunfd;
+    if(rawsockfd > nfd) nfd = rawsockfd;
+    if(timerfd > nfd) nfd = timerfd;
+
 	nfd = nfd + 1;
 
 	do {
 		FD_SET(sockfd, &fds);
+        if(rawsockfd > 0) FD_SET(rawsockfd, &fds);
 		if(tunfd > 0) FD_SET(tunfd, &fds);
+        if(timerfd > 0) FD_SET(timerfd, &fds);
+
 		tv.tv_sec = MAX_IDLE_TIME;
 		tv.tv_usec = 0;
 
@@ -297,6 +578,12 @@ int router_process() {
 		if(FD_ISSET(tunfd, &fds)) {
 			handle_tun();
 		}
+        if(FD_ISSET(rawsockfd, &fds)) {
+            handle_rawsocket();
+        }
+        if(FD_ISSET(timerfd, &fds)) {
+            handle_timer();
+        }
 	} while(ret > 0 || rid > 0);
 
 	router_close();
