@@ -12,6 +12,8 @@
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <sys/timerfd.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
 #include "octane.h"
 #include "log.h"
 #include "tun.h"
@@ -166,9 +168,9 @@ unsigned short checksum(char *addr, short count)
 
     return (unsigned short) ~sum;
 }
-uint32_t get_router_ip() {
+uint32_t get_router_ip(int router_id) {
     uint32_t addr = inet_addr(SECOND_ROUTER_INT_IP);
-    addr = ntohl(addr) + rid - 1;
+    addr = ntohl(addr) + router_id - 1;
     return htonl(addr);
 }
 /*return true if tv1 > tv2*/
@@ -399,19 +401,103 @@ void add_default_rule() {
         f.proto = 0xff;
         f.port = 0xffff;
         rule_install(&f, -1, rid);
+        return;
+    } 
+}
+void swap_src_dst(struct flow_entry *f) {
+    uint32_t tmpip = f->dst;
+    uint16_t tmpport = f->dport;
+    f->dst = f->src;
+    f->src = tmpip;
 
-        f.action = FLOW_ACT_REPLY;
+    f->dport = f->sport;
+    f->sport = tmpport;
+}
+void post_config_rule() {
+    struct flow_entry f;
+
+
+    f.proto = IPPROTO_ICMP;
+    f.sport = 0xffff;
+    f.dport = 0xffff;
+
+    /*primary router set ipaddress to secondary router*/
+    for(int i=1;i<MAX_ROUTERS;i++) {
+        if(addrs[i].sin_port == 0) continue;
+
         f.src = 0xffffffff;
-
-        f.dst = get_router_ip();
-        f.proto = IPPROTO_ICMP;
-        f.sport = 0xffff;
-        f.dport = 0xffff;
+        f.dst = get_router_ip(i);
+        f.action = FLOW_ACT_REPLY;
         f.port = ntohs(addrs[0].sin_port);
+        rule_install(&f, 0, i);
+        
+        f.action = FLOW_ACT_FORWARD;
+        f.port = ntohs(addrs[i].sin_port);
         rule_install(&f, 0, rid);
+        swap_src_dst(&f);
+        f.port = 0;
+        rule_install(&f, 0, rid);
+    }
+
+    if(stage < 6) return;
+
+    /*config HTTP rules*/
+    f.action = FLOW_ACT_FORWARD;
+    f.src = 0xffffffff;
+    f.dst = 0xffffffff;
+    f.proto = IPPROTO_TCP;
+    f.dport = htons(80);
+    f.sport = 0xffff;
+    f.port = ntohs(addrs[1].sin_port);
+    rule_install(&f, 0, 0);
+
+    f.port = 0;
+    rule_install(&f, 0, 1);
+
+    swap_src_dst(&f);
+    f.port = 0;
+    rule_install(&f, 0, 0);
+
+    f.port = ntohs(addrs[0].sin_port);
+    rule_install(&f, 0, 1);
+    
+    if(stage < 7) {
+        /*HTTPS*/
+        f.dport = htons(443);
+        f.sport = 0xffff;
+        f.port = ntohs(addrs[2].sin_port);
+        rule_install(&f, 0, 0);
+    
+        f.port = 0;
+        rule_install(&f, 0, 2);
+
+        swap_src_dst(&f);
+        f.port = 0;
+        rule_install(&f, 0, 0);
+
+        f.port = ntohs(addrs[0].sin_port);
+        rule_install(&f, 0, 2);
+    }
+    else {
+        /*stage = 7*/
+        f.dport = htons(443);
+        f.sport = 0xffff;
+        f.port = ntohs(addrs[1].sin_port);
+        rule_install(&f, 0, 0);
+        f.port = ntohs(addrs[2].sin_port);
+        rule_install(&f, 0, 1);
+        f.port = 0;
+        rule_install(&f, 0, 2);
+
+        swap_src_dst(&f);
+        f.port = ntohs(addrs[1].sin_port);
+        rule_install(&f, 0, 2);
+        f.port = ntohs(addrs[0].sin_port);
+        rule_install(&f, 0, 1);
+        f.port = 0;
+        rule_install(&f, 0, 0);
 
     }
-    
     print_flow_table(); 
 
 }
@@ -434,8 +520,7 @@ int internal_send(void *p, int len, uint16_t port) {
 int rawsocket_send(void *p, long len) {
     struct ip *ip=(struct ip *)p;
     struct icmp *icmp=(struct icmp *)(ip+1);
-
-    if((ntohl(ip->ip_dst.s_addr) & 0xffffff00) == (ntohl(get_router_ip())&0xffffff00)) {
+    if(SUBNET(ip->ip_dst.s_addr) == SUBNET(get_router_ip(rid))) {
         struct in_addr tmp = ip->ip_dst;
         ip->ip_dst = ip->ip_src;
         ip->ip_src = tmp;
@@ -467,24 +552,15 @@ int rawsocket_send(void *p, long len) {
     int ret = sendmsg(rawsockfd, &msg, 0);
     return ret;
 }
-void swap_src_dst(struct flow_entry *f) {
-    uint32_t tmpip = f->dst;
-    uint16_t tmpport = f->dport;
-    f->dst = f->src;
-    f->src = tmpip;
-
-    f->dport = f->sport;
-    f->sport = tmpport;
-}
 void distribute_rule(struct flow_entry *f) {
     static uint32_t counter = 0;
-    uint32_t router_ip = ntohl(get_router_ip());
+    uint32_t router_ip = get_router_ip(rid);
     int internal_ip = 0;
     /*only primary router distribute rules to others*/
     if(rid > 0) return;
     int old_act = f->action;
 
-    if((ntohl(f->dst) & 0xffffff00) == (router_ip & 0xffffff00))
+    if(SUBNET(f->dst) == SUBNET(router_ip))
         internal_ip = 1;
 
     f->port = ntohs(addrs[1].sin_port); /*to secondary router*/
@@ -610,6 +686,7 @@ void handle_tun() {
 
 /*read from udp socket*/
 void handle_udp() {
+    static int counter = 0;
     struct packet *pkg = (struct packet *)buf;
     unsigned int op, id;
     struct sockaddr_in addr;
@@ -632,6 +709,10 @@ void handle_udp() {
             memcpy(&addrs[id], &addr, sizeof(addr));
             log_print("router: %d, pid: %d, port: %d\n",
                 id, ntohl(p->pid), ntohs(addrs[id].sin_port));
+        }
+        counter++;
+        if(counter == num_routers) {
+            post_config_rule();
         }
     }
     else if(op == OP_CLOSE) {
@@ -723,12 +804,18 @@ int raw_socket_bind() {
     addr.sin_family = AF_INET;
     inet_aton(ipaddr, &addr.sin_addr);
 
+    /*get interface ipaddress*/
+    if(stage > 5) {
+        struct ifreq ifr;
+        char ifname[] = "eth0";
+        ifname[strlen(ifname)-1] = (char)rid;;
+        int sofd = socket(AF_INET, SOCK_DGRAM, 0);
+        ioctl(sofd, SIOCGIFADDR, &ifr);
+        addr.sin_addr = ((struct sockaddr_in *)(&ifr.ifr_addr))->sin_addr;
+        close(sofd);
+    }
     if(bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         fprintf(stderr,"bind %s error - %s\n", ipaddr, strerror(errno));
-    }
-    int val = 1;
-    if(0 && setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &val, sizeof(val) != 0)) {
-        fprintf(stderr,"setsockopt error - %s\n", strerror(errno));
     }
     return sock;
 }

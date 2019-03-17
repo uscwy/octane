@@ -10,9 +10,10 @@
 #define MAX_ROUTERS 10
 #define MAX_IDLE_TIME 15
 #define SECOND_ROUTER_EXT_IP "192.168.201.2"
-#define SECOND_ROUTER_INT_IP "10.5.51.3"
+#define SECOND_ROUTER_INT_IP "10.5.51.11"
 #define MAX_RESEND 10
 #define TIMEOUT 5
+#define SUBNET(x)   (ntohl(x) & 0xffffff00)
 struct config {
 	char name[MAX_CONF_NUM][MAX_CONF_LEN+1];
 	unsigned int val[MAX_CONF_NUM];
