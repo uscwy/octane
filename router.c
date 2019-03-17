@@ -29,6 +29,7 @@ struct flow_entry flow_table[MAX_FLOW_ENTRY];
 int entry_num;
 struct timer *timer_queue;
 struct in_addr  origin_addr;
+int drop_after;
 /*read item from conf*/
 int get_conf(const char *name, int *val) {
     int i;
@@ -82,81 +83,88 @@ int read_config(const char *fn) {
     return SUCC;
 }
 int check_conf() {
-	if(get_conf("num_routers",&num_routers) == FAIL 
-			|| num_routers < 0 || num_routers > 10) {
-		fprintf(stderr,"invalid num_routers %u\n", num_routers);
-		return FAIL;
-	}
-	if(get_conf("stage",&stage) == FAIL || 
-			stage < 0 || stage > 6) {
-		fprintf(stderr,"invalid stage %u\n", stage);
-		return FAIL;
-	}
-	return SUCC;
+    if(get_conf("num_routers",&num_routers) == FAIL 
+            || num_routers < 0 || num_routers > 10) {
+        fprintf(stderr,"invalid num_routers %u\n", num_routers);
+        return FAIL;
+    }
+    if(get_conf("stage",&stage) == FAIL || 
+            stage < 0 || stage > 6) {
+        fprintf(stderr,"invalid stage %u\n", stage);
+        return FAIL;
+    }
+    if(stage > 4) {
+        if(get_conf("drop_after", &drop_after) == FAIL 
+                || drop_after <= 0 || drop_after > 0x00ffffff) {
+            fprintf(stderr, "invalid drop_after %u\n", drop_after);
+            return FAIL;
+        }
+    }
+    return SUCC;
 }
 void router_close() {
-	log_print("router %d closed\n", rid);
-	if(rid==0) {
-		for(int i=1;i<=num_routers;i++) {
-			struct packet *p=(struct packet *)buf;
-			p->op = htonl(OP_CLOSE);
-			sendto(sockfd, buf, HDR_LEN, 0, 
-				(struct sockaddr *)&addrs[i], sizeof(addrs[i]));
-		}
-	}
-	exit(EXIT_SUCCESS);
+    log_print("router %d closed\n", rid);
+    if(rid==0) {
+        for(int i=1;i<=num_routers;i++) {
+            struct packet *p=(struct packet *)buf;
+            p->op = htonl(OP_CLOSE);
+            sendto(sockfd, buf, HDR_LEN, 0, 
+                (struct sockaddr *)&addrs[i], sizeof(addrs[i]));
+        }
+    }
+    exit(EXIT_SUCCESS);
 }
 int udp_dynamic_bind() {
-	struct sockaddr_in addr;
-	socklen_t addrlen = sizeof(addr);
-	memset(&addr, 0, sizeof(addr));
-	
-	if(sockfd > 0) close(sockfd);
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    memset(&addr, 0, sizeof(addr));
+    
+    if(sockfd > 0) close(sockfd);
 
-	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-	addr.sin_family = AF_INET;
-	if(bind(sockfd, (struct sockaddr *)&addr, addrlen) != 0) {
-		fprintf(stderr, "bind failed: %s\n", strerror(errno));
-		return FAIL;
-	}
-	if(getsockname(sockfd, (struct sockaddr *)&addr, &addrlen) != 0) {
-		fprintf(stderr, "getsockname: %s\n", strerror(errno));
-		return FAIL;
-	}
-	memcpy(&addrs[rid], &addr, addrlen);
-	if(rid == 0) {
-		addrs[0].sin_addr.s_addr = inet_addr("127.0.0.1");
-		log_print("primary port: %d\n", ntohs(addrs[0].sin_port));
-	} 
-	else {
-		log_print("router: %d, pid: %d, port: %d\n",
-				rid, getpid(),ntohs(addrs[rid].sin_port));
-	}
-	return SUCC;
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    addr.sin_family = AF_INET;
+    if(bind(sockfd, (struct sockaddr *)&addr, addrlen) != 0) {
+        fprintf(stderr, "bind failed: %s\n", strerror(errno));
+        return FAIL;
+    }
+    if(getsockname(sockfd, (struct sockaddr *)&addr, &addrlen) != 0) {
+        fprintf(stderr, "getsockname: %s\n", strerror(errno));
+        return FAIL;
+    }
+    memcpy(&addrs[rid], &addr, addrlen);
+    if(rid == 0) {
+        addrs[0].sin_addr.s_addr = inet_addr("127.0.0.1");
+        log_print("primary port: %d\n", ntohs(addrs[0].sin_port));
+    } 
+    else {
+        log_print("router: %d, pid: %d, port: %d\n",
+                rid, getpid(),ntohs(addrs[rid].sin_port));
+    }
+    return SUCC;
 }
 unsigned short checksum(char *addr, short count)
 {
-       /* Compute Internet Checksum for "count" bytes
-        *         beginning at location "addr".
-        */
-       register long sum = 0;
+    /* Compute Internet Checksum for "count" bytes
+    *         beginning at location "addr".
+    */
+    register long sum = 0;
 
-        while( count > 1 )  {
-           /*  This is the inner loop */
-               sum += *(unsigned short *) addr;
-	       addr += 2;
-               count -= 2;
-       }
+    while( count > 1 )  {
+        /*  This is the inner loop */
+        sum += *(unsigned short *) addr;
+        addr += 2;
+        count -= 2;
+    }
 
-           /*  Add left-over byte, if any */
-       if( count > 0 )
-               sum += * (unsigned char *) addr;
+       /*  Add left-over byte, if any */
+    if( count > 0 )
+           sum += * (unsigned char *) addr;
 
-           /*  Fold 32-bit sum to 16 bits */
-       while (sum>>16)
-           sum = (sum & 0xffff) + (sum >> 16);
+       /*  Fold 32-bit sum to 16 bits */
+    while (sum>>16)
+       sum = (sum & 0xffff) + (sum >> 16);
 
-       return (unsigned short) ~sum;
+    return (unsigned short) ~sum;
 }
 uint32_t get_router_ip() {
     uint32_t addr = inet_addr(SECOND_ROUTER_INT_IP);
@@ -235,11 +243,10 @@ struct timer *timer_resend(struct timer *t) {
         return NULL;
     }
     t->resend++;
-    struct packet *pkg=(struct packet *)t->packet;
-    struct octane_control *ctl=(struct octane_control *)pkg->data;
+    //struct packet *pkg=(struct packet *)t->packet;
+    //struct octane_control *ctl=(struct octane_control *)pkg->data;
     sendto(t->sockfd, t->packet, t->len, 0, 
             (struct sockaddr *)&(t->addr), sizeof(struct sockaddr));
-    printf("timer send %d, try=%d, rid=%d\n", ntohs(ctl->seqno),t->resend, rid);
     return t;
 }
 
@@ -247,7 +254,6 @@ struct timer *timer_resend(struct timer *t) {
 void handle_timer() {
     uint64_t exp;
     struct timespec now;
-    //clock_gettime(CLOCK_REALTIME, &now);
 
     struct timer *timer = timer_queue;
     struct timer *next;
@@ -285,7 +291,8 @@ void timer_add(int sockfd, void *packet, int len, struct sockaddr_in *addr) {
 }
 void rule_send(struct flow_entry *f, int offset, int target_rid) {
     static uint16_t seqno = 1;
-	struct packet *pkg=(struct packet *)buf;
+    char bf[sizeof(struct octane_control)+32];
+    struct packet *pkg=(struct packet *)bf;
     struct octane_control *ctl=(struct octane_control *)pkg->data;
     struct sockaddr_in addr;
 
@@ -409,8 +416,8 @@ void add_default_rule() {
 
 }
 int internal_send(void *p, int len, uint16_t port) {
-    
-    struct packet *pkg=(struct packet *)buf;
+    char b[1600]; 
+    struct packet *pkg=(struct packet *)b;
     struct sockaddr_in addr;
 
     memset(&addr, 0, sizeof(addr));
@@ -419,8 +426,7 @@ int internal_send(void *p, int len, uint16_t port) {
 
     pkg->op=htonl(OP_PACKET);
     memcpy(pkg->data, p, len);
-    printf("rid:%d, internal send to %d\n", rid, port);
-
+    printf("internal packet to %d, rid=%d\n", port,rid);
     return sendto(sockfd, pkg, HDR_LEN+len, 0,
          (struct sockaddr *)&addr, sizeof(addr));
     
@@ -429,8 +435,7 @@ int rawsocket_send(void *p, long len) {
     struct ip *ip=(struct ip *)p;
     struct icmp *icmp=(struct icmp *)(ip+1);
 
-
-    if(ip->ip_dst.s_addr == get_router_ip()) {
+    if((ntohl(ip->ip_dst.s_addr) & 0xffffff00) == (ntohl(get_router_ip())&0xffffff00)) {
         struct in_addr tmp = ip->ip_dst;
         ip->ip_dst = ip->ip_src;
         ip->ip_src = tmp;
@@ -472,52 +477,67 @@ void swap_src_dst(struct flow_entry *f) {
     f->sport = tmpport;
 }
 void distribute_rule(struct flow_entry *f) {
+    static uint32_t counter = 0;
     uint32_t router_ip = ntohl(get_router_ip());
     int internal_ip = 0;
     /*only primary router distribute rules to others*/
     if(rid > 0) return;
+    int old_act = f->action;
 
-    if(ntohl(f->dst) > router_ip && ntohl(f->dst) < router_ip + MAX_ROUTERS)
+    if((ntohl(f->dst) & 0xffffff00) == (router_ip & 0xffffff00))
         internal_ip = 1;
 
     f->port = ntohs(addrs[1].sin_port); /*to secondary router*/
     rule_install(f, 0, rid); 
     f->port = 0; /*to rawsocket*/
     /*install rule to all secondary routers*/
-    if(internal_ip == 0) {
-        for(int target_rid = 1;target_rid<MAX_ROUTERS;target_rid++) {
-            if(addrs[target_rid].sin_port > 0) rule_install(f, 0, target_rid);
-        }
+    if(internal_ip == 1) {
+        f->action = FLOW_ACT_REPLY;
+        f->port = htons(addrs[0].sin_port);
     }
+    /*drop after N*/
+    counter++;
+    if(stage > 4 && counter > drop_after) {
+        f->action = FLOW_ACT_DROP;
+        counter = 0;
+    }
+
+    for(int target_rid = 1;target_rid<MAX_ROUTERS;target_rid++) {
+        if(addrs[target_rid].sin_port > 0) rule_install(f, 0, target_rid);
+    }
+
     swap_src_dst(f);
+    f->action = FLOW_ACT_FORWARD;
     f->port = 0; /*to tun*/
     rule_install(f, 0, rid);
 
     f->port = ntohs(addrs[0].sin_port); /*to primary router*/
 
     if(internal_ip == 0) {
-    for(int target_rid = 1;target_rid<MAX_ROUTERS;target_rid++) {
-        if(addrs[target_rid].sin_port > 0) rule_install(f, 0, target_rid);
+        for(int target_rid = 1;target_rid<MAX_ROUTERS;target_rid++) {
+            if(addrs[target_rid].sin_port > 0) rule_install(f, 0, target_rid);
+        }
     }
-    }
-
+    f->action = old_act;
 }
 /*packet handler*/
 void packet_input(char *p, int len, struct sockaddr_in *s) {
-	struct ip *ip=(struct ip *)p;
-	struct icmp *icmp=(struct icmp *)(ip+1);
-	char from[64],ipsrc[32];
+    struct ip *ip=(struct ip *)p;
+    struct icmp *icmp=(struct icmp *)(ip+1);
+    char from[64],ipsrc[32];
 
-	if(s==NULL) strcpy(from,"tunnel");
-	else sprintf(from,"port %d",ntohs(s->sin_port));
-	
+    if(s==NULL) {
+        if(rid == 0) strcpy(from,"tunnel");
+        else strcpy(from, "raw sock");
+    }
+    else sprintf(from,"port %d",ntohs(s->sin_port));
+    
     strcpy(ipsrc, inet_ntoa(ip->ip_src));
 
-	if(ip->ip_p==IPPROTO_ICMP) {
-	    strcpy(ipsrc, inet_ntoa(ip->ip_src));
-	    log_print("ICMP from %s, src: %s, dst: %s, type: %d\n",
-		    from, ipsrc, inet_ntoa(ip->ip_dst),
-		    icmp->icmp_type);
+    if(ip->ip_p==IPPROTO_ICMP) {
+        log_print("ICMP from %s, src: %s, dst: %s, type: %d\n",
+            from, ipsrc, inet_ntoa(ip->ip_dst),
+            icmp->icmp_type);
     }
     if(stage == 3) {
         if(rid == 0) { 
@@ -529,7 +549,7 @@ void packet_input(char *p, int len, struct sockaddr_in *s) {
             else rawsocket_send(p,len);
         }
         return;
-    }	
+    }    
     struct flow_entry f,*flow;
     f.src = ip->ip_src.s_addr;
     f.dst = ip->ip_dst.s_addr;
@@ -554,17 +574,20 @@ void packet_input(char *p, int len, struct sockaddr_in *s) {
         if(stage > 3) 
             log_print("router: %d, rule hit %s\n", rid, flow_to_str(flow));
     }
-    printf("rid=%d, flow=%p, src=%s, dst=%s\n",rid, flow, ipsrc, inet_ntoa(ip->ip_dst));
     if(flow == NULL) return;
+    printf("act=%d,%s->%s, rid=%d\n", flow->action, ipsrc, inet_ntoa(ip->ip_dst), rid);
     if(flow->action == FLOW_ACT_FORWARD) {
         if(flow->port == 0) {
-            if(rid==0) tun_write(tunfd,p,len);
+            if(rid==0) {
+                tun_write(tunfd,p,len);
+                printf("write tunfd %d,%s\n", len, ipsrc);
+            }
             else rawsocket_send(p, len);
         }
         else internal_send(p, len, flow->port);
     }
-	if(flow->action == FLOW_ACT_REPLY) {
-	    if(ip->ip_p!=IPPROTO_ICMP) return;
+    if(flow->action == FLOW_ACT_REPLY) {
+        if(ip->ip_p!=IPPROTO_ICMP) return;
         struct in_addr tmp = ip->ip_src;
 
         ip->ip_src = ip->ip_dst;
@@ -575,53 +598,51 @@ void packet_input(char *p, int len, struct sockaddr_in *s) {
         icmp->icmp_cksum = (checksum((char *)icmp, 64));
         
         internal_send(p, len, (flow->port));
-	}
+    }
 }
 void handle_tun() {
-	struct packet *pkg = (struct packet *)buf;
-	pkg->op = OP_PACKET;
-	int len = tun_read(tunfd, pkg->data, BUF_LEN-HDR_LEN);
-	if(len <= 0) return;
-	packet_input(pkg->data, len, NULL);
-	/*for(int i=1;i<=num_routers;i++) {
-	        int r = sendto(sockfd, pkg, HDR_LEN+len, 0,
-                                (struct sockaddr *)&addrs[i], sizeof(addrs[i]));
-	        if(r<0) fprintf(stderr, "sendto failed %s\n", strerror(errno));
-	}*/
+    struct packet *pkg = (struct packet *)buf;
+    pkg->op = OP_PACKET;
+    int len = tun_read(tunfd, pkg->data, BUF_LEN-HDR_LEN);
+    if(len <= 0) return;
+    packet_input(pkg->data, len, NULL);
 }
 
 /*read from udp socket*/
 void handle_udp() {
-	struct packet *pkg = (struct packet *)buf;
-	unsigned int op, id;
-	struct sockaddr_in addr;
-	socklen_t addrlen = sizeof(addr);
-	int len;
+    struct packet *pkg = (struct packet *)buf;
+    unsigned int op, id;
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    int len;
 
-	len = recvfrom(sockfd, pkg, BUF_LEN, MSG_DONTWAIT,
-		(struct sockaddr *)&addr, &addrlen);
+    len = recvfrom(sockfd, pkg, BUF_LEN, MSG_DONTWAIT,
+        (struct sockaddr *)&addr, &addrlen);
 
 
-	if(len < HDR_LEN) {
-		return;
-	}
-	op = ntohl(pkg->op);
-	if(op == OP_HELLO) {
-		struct pkg_hello *p = (struct pkg_hello *)pkg->data;
-		id = ntohl(p->rid);
-		if(addrs[id].sin_port == 0) {
-			memcpy(&addrs[id], &addr, sizeof(addr));
-			log_print("router: %d, pid: %d, port: %d\n",
-				id, ntohl(p->pid), ntohs(addrs[id].sin_port));
-		}
-	}
-	else if(op == OP_CLOSE) {
-		router_close();
-	}
-	else if(op == OP_PACKET) {
-		packet_input(pkg->data, len-HDR_LEN, &addr);
-	}
+    if(len < HDR_LEN) {
+        return;
+    }
+    op = ntohl(pkg->op);
+    if(op == OP_HELLO) {
+        /*secondary registration*/
+        struct pkg_hello *p = (struct pkg_hello *)pkg->data;
+        id = ntohl(p->rid);
+        if(addrs[id].sin_port == 0) {
+            memcpy(&addrs[id], &addr, sizeof(addr));
+            log_print("router: %d, pid: %d, port: %d\n",
+                id, ntohl(p->pid), ntohs(addrs[id].sin_port));
+        }
+    }
+    else if(op == OP_CLOSE) {
+        router_close();
+    }
+    else if(op == OP_PACKET) {
+        /*packet deliver*/
+        packet_input(pkg->data, len-HDR_LEN, &addr);
+    }
     else if(op == OP_CONTROL) {
+        /*flow table control*/
         struct flow_entry f;
         struct octane_control *ctl = (struct octane_control *)pkg->data;
         f.action = ctl->action;
@@ -633,15 +654,16 @@ void handle_udp() {
         f.port = ntohs(ctl->port);
 
         if(ctl->flags == 0) {
+            /*receive new rule from primary router*/
             rule_install(&f, 0, rid);
             ctl->flags = 1; /*send ack*/
             sendto(sockfd, pkg, len, 0, (struct sockaddr *)&addr, addrlen);
         } else {
-            /*receive ack*/
+            /*receive ack from secondary router*/
             timer_recv_ack(ntohs(ctl->seqno));
         }
     }
-	return;
+    return;
 
 }
 /*packet handler for raw socket*/
@@ -652,7 +674,7 @@ void handle_rawsocket() {
     char src[32]={0}, dst[32]={0};
     int len;
     struct ip *ip = (struct ip *)pkg->data;
-	struct icmp *icmp=(struct icmp *)(ip+1);
+    struct icmp *icmp=(struct icmp *)(ip+1);
 
     len = recvfrom(rawsockfd, pkg->data, BUF_LEN, MSG_DONTWAIT,
         (struct sockaddr *)&addr, &addrlen);
@@ -660,7 +682,7 @@ void handle_rawsocket() {
     if(len < sizeof(struct ip)) {
         return;
     }
-	if(ip->ip_p!=IPPROTO_ICMP) return;
+    if(ip->ip_p!=IPPROTO_ICMP) return;
 
     strcpy(src, inet_ntoa(ip->ip_src));
     strcpy(dst, inet_ntoa(ip->ip_dst));
@@ -668,25 +690,26 @@ void handle_rawsocket() {
             src, dst, icmp->icmp_type);
     /*restore original address*/
     ip->ip_dst = origin_addr;
-
     ip->ip_sum = 0;
-    ip->ip_sum = checksum((char *)ip, ip->ip_hl);
-    //icmp->icmp_cksum = (checksum((char *)icmp, 64));
-    internal_send(ip, len, ntohs(addrs[0].sin_port));
+    ip->ip_sum = checksum((char *)ip, 20);
+    icmp->icmp_cksum = 0;
+    icmp->icmp_cksum = checksum((char *)icmp, 64);
+    packet_input(pkg->data, len, NULL);
+    //internal_send(ip, len, ntohs(addrs[0].sin_port));
 }
 void send_hello() {
-	struct packet *hdr = (struct packet *)buf;
-	struct pkg_hello *hello=(struct pkg_hello *)(hdr+1);
-	hdr->op = htonl(OP_HELLO);
-	hello->pid = htonl(getpid());
-	hello->rid = htonl(rid);
-	int len = HDR_LEN + sizeof(struct pkg_hello);
-	sendto(sockfd, hdr, len, 0, 
-			(struct sockaddr *)&addrs[0], sizeof(addrs[0]));
+    struct packet *hdr = (struct packet *)buf;
+    struct pkg_hello *hello=(struct pkg_hello *)(hdr+1);
+    hdr->op = htonl(OP_HELLO);
+    hello->pid = htonl(getpid());
+    hello->rid = htonl(rid);
+    int len = HDR_LEN + sizeof(struct pkg_hello);
+    sendto(sockfd, hdr, len, 0, 
+            (struct sockaddr *)&addrs[0], sizeof(addrs[0]));
 
-	/*fprintf(stderr,"rid=%d, sendto %s:%d\n",rid,
-			inet_ntoa(addrs[0].sin_addr),
-			htons(addrs[0].sin_port));*/
+    /*fprintf(stderr,"rid=%d, sendto %s:%d\n",rid,
+            inet_ntoa(addrs[0].sin_addr),
+            htons(addrs[0].sin_port));*/
 
 }
 int raw_socket_bind() {
@@ -719,7 +742,7 @@ int router_process() {
     int ret;
 
     FD_ZERO(&fds);
-	/*open tun dev*/
+    /*open tun dev*/
     if(stage>1 && rid == 0) {
         tunfd = tun_alloc(tun);
     }
@@ -735,71 +758,71 @@ int router_process() {
     /*install default flow entry*/
     if(stage > 2) add_default_rule();
 
-	memset(&tv, 0, sizeof(tv));
+    memset(&tv, 0, sizeof(tv));
 
-	nfd = sockfd;
-	if(tunfd > nfd) nfd = tunfd;
+    nfd = sockfd;
+    if(tunfd > nfd) nfd = tunfd;
     if(rawsockfd > nfd) nfd = rawsockfd;
     if(timerfd > nfd) nfd = timerfd;
 
-	nfd = nfd + 1;
+    nfd = nfd + 1;
 
-	do {
-		FD_SET(sockfd, &fds);
+    do {
+        FD_SET(sockfd, &fds);
         if(rawsockfd > 0) FD_SET(rawsockfd, &fds);
-		if(tunfd > 0) FD_SET(tunfd, &fds);
+        if(tunfd > 0) FD_SET(tunfd, &fds);
         if(timerfd > 0) FD_SET(timerfd, &fds);
 
 
-		tv.tv_sec = MAX_IDLE_TIME;
-		tv.tv_usec = 0;
+        tv.tv_sec = MAX_IDLE_TIME;
+        tv.tv_usec = 0;
 
-		ret = select(nfd, &fds, NULL, NULL, &tv);
-	       	
-		if(FD_ISSET(sockfd, &fds)) {
-			handle_udp();
-		}
-		if(FD_ISSET(tunfd, &fds)) {
-			handle_tun();
-		}
+        ret = select(nfd, &fds, NULL, NULL, &tv);
+               
+        if(FD_ISSET(sockfd, &fds)) {
+            handle_udp();
+        }
+        if(FD_ISSET(tunfd, &fds)) {
+            handle_tun();
+        }
         if(FD_ISSET(rawsockfd, &fds)) {
             handle_rawsocket();
         }
         if(FD_ISSET(timerfd, &fds)) {
             handle_timer();
         }
-	} while(ret > 0 || rid > 0);
+    } while(ret > 0 || rid > 0);
 
-	router_close();
-	return 0;
+    router_close();
+    return 0;
 }
 /*create other router instance*/
 void create_router() {
-	int id;
-	for(id=1;id<=num_routers;id++) {
-		if(fork() == 0) {
-			rid = id;
-			log_init();
-			udp_dynamic_bind();
-			router_process();
-		}
-	}
+    int id;
+    for(id=1;id<=num_routers;id++) {
+        if(fork() == 0) {
+            rid = id;
+            log_init();
+            udp_dynamic_bind();
+            router_process();
+        }
+    }
 }
 
 int main(int argc, char **argv) {
-        if(argc != 2) {
-                fprintf(stderr,"Usage: %s config_file\n", argv[0]);
-                return 1;
-        }
-        if(read_config(argv[1]) != SUCC || check_conf() != SUCC) {
-                return 1;
-        }
-        printf("num_routers=%u stage=%u\n",num_routers,stage);
-	log_init();
-	udp_dynamic_bind();
-	create_router();
-	/*start primary router*/
-	router_process();
-        return 0;
+    if(argc != 2) {
+        fprintf(stderr,"Usage: %s config_file\n", argv[0]);
+        return 1;
+    }
+    if(read_config(argv[1]) != SUCC || check_conf() != SUCC) {
+        return 1;
+    }
+    printf("num_routers=%u stage=%u drop_after=%d\n",num_routers,stage,drop_after);
+    log_init();
+    udp_dynamic_bind();
+    create_router();
+    /*start primary router*/
+    router_process();
+    return 0;
 }
 
