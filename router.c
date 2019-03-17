@@ -10,6 +10,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include <netinet/ip_icmp.h>
 #include <sys/timerfd.h>
 #include <net/if.h>
@@ -227,7 +229,6 @@ void timer_free(struct timer *t) {
 }
 void timer_recv_ack(int16_t seq) {
     struct timer *t = timer_queue;
-    printf("ack %d, rid=%d\n",seq, rid);
     while(t != NULL) {
         struct packet *pkg = (struct packet *)t->packet;
         struct octane_control *ctl=(struct octane_control *)pkg->data;
@@ -311,7 +312,6 @@ void rule_send(struct flow_entry *f, int offset, int target_rid) {
     ctl->protocol = f->proto;
     ctl->port = htons(f->port);
 
-    printf("rule send to %d\n", target_rid);
     int len = HDR_LEN + sizeof(struct octane_control);
     timer_add(sockfd, pkg, len, &addr);
     seqno++;
@@ -502,8 +502,7 @@ void post_config_rule() {
 
 }
 int internal_send(void *p, int len, uint16_t port) {
-    char b[1600]; 
-    struct packet *pkg=(struct packet *)b;
+    struct packet *pkg=(struct packet *)buf;
     struct sockaddr_in addr;
 
     memset(&addr, 0, sizeof(addr));
@@ -512,12 +511,11 @@ int internal_send(void *p, int len, uint16_t port) {
 
     pkg->op=htonl(OP_PACKET);
     memcpy(pkg->data, p, len);
-    printf("internal packet to %d, rid=%d\n", port,rid);
     return sendto(sockfd, pkg, HDR_LEN+len, 0,
          (struct sockaddr *)&addr, sizeof(addr));
     
 }
-int rawsocket_send(void *p, long len) {
+int rawsocket_send(void *p, int len) {
     struct ip *ip=(struct ip *)p;
     struct icmp *icmp=(struct icmp *)(ip+1);
     if(SUBNET(ip->ip_dst.s_addr) == SUBNET(get_router_ip(rid))) {
@@ -531,7 +529,7 @@ int rawsocket_send(void *p, long len) {
         /*send reply to primary*/
         return internal_send(p, len, ntohs(addrs[0].sin_port));
     }
-
+    printf("raw send len=%d rid=%d\n",len,rid);
     struct iovec iov[1];
     iov[0].iov_base = icmp;
     iov[0].iov_len = len-sizeof(struct ip);
@@ -558,15 +556,44 @@ void distribute_rule(struct flow_entry *f) {
     int internal_ip = 0;
     /*only primary router distribute rules to others*/
     if(rid > 0) return;
-    int old_act = f->action;
+    int target_rid = 1;
+    /*keep input parameter*/
+    struct flow_entry entry = *f;
 
-    if(SUBNET(f->dst) == SUBNET(router_ip))
+    if(SUBNET(f->dst) == SUBNET(router_ip)) {
         internal_ip = 1;
+        if(stage >= 6 && f->dst == get_router_ip(2)) target_rid = 2;
+    }
 
-    f->port = ntohs(addrs[1].sin_port); /*to secondary router*/
-    rule_install(f, 0, rid); 
+    if(stage == 6 && f->proto == IPPROTO_TCP) {
+        /*stage 6 policy*/
+        if(ntohs(f->dport) == 80) target_rid = 1;
+        else if(ntohs(f->dport) == 443) target_rid = 2;
+    }
+    if(stage == 7 && f->proto == IPPROTO_TCP && ntohs(f->dport) == 443) {
+        /*stage 7 policy, direct https to r1 and then r2*/
+        f->port = ntohs(addrs[1].sin_port);
+        rule_install(f, 0, 0); 
+        f->port = ntohs(addrs[2].sin_port);
+        rule_install(f, 0, 1);
+        f->port = 0;
+        rule_install(f, 0, 2);
+        swap_src_dst(f);
+        f->port = ntohs(addrs[1].sin_port);
+        rule_install(f, 0, 2);
+        f->port = ntohs(addrs[0].sin_port);
+        rule_install(f, 0, 1);
+        f->port = 0;
+        rule_install(f, 0, 0);
+        
+        *f = entry;
+        f->port = ntohs(addrs[1].sin_port);
+        return;
+    }
+    f->port = ntohs(addrs[target_rid].sin_port); /*point to target router*/
+    rule_install(f, 0, 0); /*install on primary*/
+
     f->port = 0; /*to rawsocket*/
-    /*install rule to all secondary routers*/
     if(internal_ip == 1) {
         f->action = FLOW_ACT_REPLY;
         f->port = htons(addrs[0].sin_port);
@@ -577,51 +604,72 @@ void distribute_rule(struct flow_entry *f) {
         f->action = FLOW_ACT_DROP;
         counter = 0;
     }
-
-    for(int target_rid = 1;target_rid<MAX_ROUTERS;target_rid++) {
-        if(addrs[target_rid].sin_port > 0) rule_install(f, 0, target_rid);
-    }
+    /*install rule to secondary routers*/
+    rule_install(f, 0, target_rid);
 
     swap_src_dst(f);
     f->action = FLOW_ACT_FORWARD;
     f->port = 0; /*to tun*/
     rule_install(f, 0, rid);
 
-    f->port = ntohs(addrs[0].sin_port); /*to primary router*/
+    f->port = ntohs(addrs[0].sin_port); /*point to primary router*/
 
     if(internal_ip == 0) {
-        for(int target_rid = 1;target_rid<MAX_ROUTERS;target_rid++) {
-            if(addrs[target_rid].sin_port > 0) rule_install(f, 0, target_rid);
-        }
+        rule_install(f, 0, target_rid);
     }
-    f->action = old_act;
+    /*keep original action*/
+    *f = entry;
+    f->port = ntohs(addrs[target_rid].sin_port);
 }
-/*packet handler*/
-void packet_input(char *p, int len, struct sockaddr_in *s) {
+void log_packet(void *p, uint16_t port) {
+    char from[16];
+    char ipsrc[32];
     struct ip *ip=(struct ip *)p;
     struct icmp *icmp=(struct icmp *)(ip+1);
-    char from[64],ipsrc[32];
+    struct tcphdr *tcp=(struct tcphdr *)(ip+1);
+    struct udphdr *udp=(struct udphdr *)(ip+1);
 
-    if(s==NULL) {
-        if(rid == 0) strcpy(from,"tunnel");
-        else strcpy(from, "raw sock");
-    }
-    else sprintf(from,"port %d",ntohs(s->sin_port));
+    if(port == 0 && rid == 0) strcpy(from, "tunnel");
+    else if(port == 0 && rid > 0) strcpy(from, "raw scok");
+    else sprintf(from, "port %d", port);
     
     strcpy(ipsrc, inet_ntoa(ip->ip_src));
-
-    if(ip->ip_p==IPPROTO_ICMP) {
+    if(ip->ip_p == IPPROTO_ICMP) {
         log_print("ICMP from %s, src: %s, dst: %s, type: %d\n",
             from, ipsrc, inet_ntoa(ip->ip_dst),
             icmp->icmp_type);
     }
+    else if(ip->ip_p == IPPROTO_TCP) {
+        log_print("TCP from %s, (%s, %hu, %s, %hu)\n",
+            from, ipsrc, ntohs(tcp->th_sport), inet_ntoa(ip->ip_dst),
+            ntohs(tcp->th_dport));
+    }
+    else if(ip->ip_p == IPPROTO_UDP) {
+        log_print("UDP from %s, (%s, %hu, %s, %hu)\n",
+            from, ipsrc, ntohs(udp->uh_sport), inet_ntoa(ip->ip_dst),
+            ntohs(udp->uh_dport));
+    }
+    else {
+        log_print("IP from %s, (%s, %s, %h)\n",
+            from, ipsrc, inet_ntoa(ip->ip_dst), ip->ip_p);
+    }
+}
+/*packet handler*/
+void packet_input(char *p, int len, uint16_t port) {
+    struct ip *ip=(struct ip *)p;
+    struct icmp *icmp=(struct icmp *)(ip+1);
+    struct tcphdr *tcp=(struct tcphdr *)(ip+1);
+    struct udphdr *udp=(struct udphdr *)(ip+1);
+
+    if(port>0) log_packet(p, port);
+
     if(stage == 3) {
         if(rid == 0) { 
-            if(s == NULL) internal_send(p, len, ntohs(addrs[1].sin_port));
+            if(port == 0) internal_send(p, len, ntohs(addrs[1].sin_port));
             else tun_write(tunfd, p, len);
         }
         else {
-            if(s == NULL) internal_send(p, len, ntohs(addrs[0].sin_port));
+            if(port == 0) internal_send(p, len, ntohs(addrs[0].sin_port));
             else rawsocket_send(p,len);
         }
         return;
@@ -633,12 +681,16 @@ void packet_input(char *p, int len, struct sockaddr_in *s) {
     f.sport = 0xffff;
     f.dport = 0xffff;
     if(ip->ip_p == IPPROTO_TCP) {
+        f.sport = tcp->th_sport;
+        f.dport = tcp->th_dport;
     }
     if(ip->ip_p == IPPROTO_UDP) {
+        f.sport = udp->uh_sport;
+        f.dport = udp->uh_dport;
     }
     flow = find_flow_entry(&f);
     if(flow==NULL) {
-        if(s==NULL) {
+        if(port==0) {
             /*packet from tun, install new rule*/
             f.action = FLOW_ACT_FORWARD;
             distribute_rule(&f);
@@ -651,14 +703,19 @@ void packet_input(char *p, int len, struct sockaddr_in *s) {
             log_print("router: %d, rule hit %s\n", rid, flow_to_str(flow));
     }
     if(flow == NULL) return;
-    printf("act=%d,%s->%s, rid=%d\n", flow->action, ipsrc, inet_ntoa(ip->ip_dst), rid);
+    char ipsrc[32];
+    strcpy(ipsrc, inet_ntoa(ip->ip_src));
+    printf("%s->%s, act=%d, port=%d, rid=%d\n", 
+                ipsrc, inet_ntoa(ip->ip_dst), flow->action, flow->port, rid);
     if(flow->action == FLOW_ACT_FORWARD) {
-        if(flow->port == 0) {
+        if(flow->port == 0 && port!=flow->port) {
             if(rid==0) {
                 tun_write(tunfd,p,len);
-                printf("write tunfd %d,%s\n", len, ipsrc);
             }
             else rawsocket_send(p, len);
+        }
+        else if(port == flow->port) {
+            /*prevent loopback*/
         }
         else internal_send(p, len, flow->port);
     }
@@ -681,7 +738,8 @@ void handle_tun() {
     pkg->op = OP_PACKET;
     int len = tun_read(tunfd, pkg->data, BUF_LEN-HDR_LEN);
     if(len <= 0) return;
-    packet_input(pkg->data, len, NULL);
+    log_packet(pkg->data, 0);
+    packet_input(pkg->data, len, 0);
 }
 
 /*read from udp socket*/
@@ -712,7 +770,7 @@ void handle_udp() {
         }
         counter++;
         if(counter == num_routers) {
-            post_config_rule();
+            /*post_config_rule();*/
         }
     }
     else if(op == OP_CLOSE) {
@@ -720,7 +778,7 @@ void handle_udp() {
     }
     else if(op == OP_PACKET) {
         /*packet deliver*/
-        packet_input(pkg->data, len-HDR_LEN, &addr);
+        packet_input(pkg->data, len-HDR_LEN, ntohs(addr.sin_port));
     }
     else if(op == OP_CONTROL) {
         /*flow table control*/
@@ -752,10 +810,8 @@ void handle_rawsocket() {
     struct packet *pkg = (struct packet *)buf;
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
-    char src[32]={0}, dst[32]={0};
     int len;
     struct ip *ip = (struct ip *)pkg->data;
-    struct icmp *icmp=(struct icmp *)(ip+1);
 
     len = recvfrom(rawsockfd, pkg->data, BUF_LEN, MSG_DONTWAIT,
         (struct sockaddr *)&addr, &addrlen);
@@ -763,20 +819,15 @@ void handle_rawsocket() {
     if(len < sizeof(struct ip)) {
         return;
     }
-    if(ip->ip_p!=IPPROTO_ICMP) return;
-
-    strcpy(src, inet_ntoa(ip->ip_src));
-    strcpy(dst, inet_ntoa(ip->ip_dst));
-    log_print("ICMP from raw sock, src: %s, dst: %s, type: %d\n", 
-            src, dst, icmp->icmp_type);
+    log_packet(pkg->data, 0);
+    
     /*restore original address*/
     ip->ip_dst = origin_addr;
     ip->ip_sum = 0;
     ip->ip_sum = checksum((char *)ip, 20);
-    icmp->icmp_cksum = 0;
-    icmp->icmp_cksum = checksum((char *)icmp, 64);
-    packet_input(pkg->data, len, NULL);
-    //internal_send(ip, len, ntohs(addrs[0].sin_port));
+    /*icmp->icmp_cksum = 0;
+    icmp->icmp_cksum = checksum((char *)icmp, 64);*/
+    packet_input(pkg->data, len, 0);
 }
 void send_hello() {
     struct packet *hdr = (struct packet *)buf;
@@ -809,11 +860,11 @@ int raw_socket_bind() {
         struct ifreq ifr;
         char ifname[] = "eth0";
         ifname[strlen(ifname)-1] += rid;
-	strcpy(ifr.ifr_name, ifname);
+        strcpy(ifr.ifr_name, ifname);
         int sofd = socket(AF_INET, SOCK_DGRAM, 0);
         ioctl(sofd, SIOCGIFADDR, &ifr);
         addr.sin_addr = ((struct sockaddr_in *)(&ifr.ifr_addr))->sin_addr;
-	printf("%s rid=%d\n", inet_ntoa(addr.sin_addr),rid);
+	    printf("interface: %s rid=%d\n", inet_ntoa(addr.sin_addr),rid);
         close(sofd);
     }
     if(bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {

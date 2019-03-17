@@ -1,7 +1,7 @@
 #This is a comment line, should be ignored
-stage 6
+stage 5
 # There can be other comments, or variable numbers of spaces or tabs in lines.
 # Clarification 2019-01-21: 1 router means one secondary router,
 # in addition to the implicit primary router.
-num_routers 2
+num_routers 1
 drop_after 10
