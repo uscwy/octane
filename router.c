@@ -325,8 +325,8 @@ char *flow_to_str(struct flow_entry *f) {
     d.s_addr = f->dst;
     strcpy(src,inet_ntoa(s));
     strcpy(dst,inet_ntoa(d));
-    sprintf(str,"(%s, %d, %s, %d, %d) action %d", src,
-            ntohs(f->sport), dst, ntohs(f->dport), f->proto, (f->action));
+    sprintf(str,"(%s, %d, %s, %d, %d) action %d port %d", src,
+            ntohs(f->sport), dst, ntohs(f->dport), f->proto, (f->action), f->port);
     return str;
 }
 /*add rule to flow table, offset=0 from the beginning, offset=-1 from the last*/
@@ -808,10 +808,12 @@ int raw_socket_bind() {
     if(stage > 5) {
         struct ifreq ifr;
         char ifname[] = "eth0";
-        ifname[strlen(ifname)-1] = (char)rid;;
+        ifname[strlen(ifname)-1] += rid;
+	strcpy(ifr.ifr_name, ifname);
         int sofd = socket(AF_INET, SOCK_DGRAM, 0);
         ioctl(sofd, SIOCGIFADDR, &ifr);
         addr.sin_addr = ((struct sockaddr_in *)(&ifr.ifr_addr))->sin_addr;
+	printf("%s rid=%d\n", inet_ntoa(addr.sin_addr),rid);
         close(sofd);
     }
     if(bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
