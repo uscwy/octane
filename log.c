@@ -21,5 +21,6 @@ void log_print(char *fmt, ...) {
 	vfprintf(logfp, fmt, ap);
 	va_end(ap);
 	fflush(logfp);
+
 }
 

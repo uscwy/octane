@@ -10,9 +10,9 @@
 #define MAX_ROUTERS 10
 #define MAX_IDLE_TIME 15
 #define SECOND_ROUTER_EXT_IP "192.168.201.2"
-#define SECOND_ROUTER_INT_IP "10.5.51.2"
+#define SECOND_ROUTER_INT_IP "10.5.51.3"
 #define MAX_RESEND 10
-#define TIMEOUT 2
+#define TIMEOUT 5
 struct config {
 	char name[MAX_CONF_NUM][MAX_CONF_LEN+1];
 	unsigned int val[MAX_CONF_NUM];
@@ -63,10 +63,11 @@ struct flow_entry {
     uint16_t port;
     uint8_t action;
 };
-#define FLOW_ACT_FORWARD 1
-#define FLOW_ACT_DROP 2
-#define FLOW_ACT_REPLY 3
-#define FLOW_ACT_UNUSED 255
+#define FLOW_ACT_UNUSED     0
+#define FLOW_ACT_FORWARD    1
+#define FLOW_ACT_REPLY      2
+#define FLOW_ACT_DROP       3
+#define FLOW_ACT_REMOVE     4
 
 #define MAX_FLOW_ENTRY 128
 #define HDR_LEN (sizeof(struct packet))
