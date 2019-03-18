@@ -27,7 +27,8 @@ CRITICAL FUNCTIONS:
 --------------------
 router.c
 packet_input      handle input packet, searching flow table and deliver to the next
-handle_rawsocket  secondary router read packet from raw socket
+handle_rawsocket  secondary router reads packet from raw socket
+handle_tun        primary router reads packet from tun interface
 handle_internal   handle internal packets between routers
 handle_timer      handle timer event for retransimit queue
 rule_send         primary router send flow entry to secondary router
