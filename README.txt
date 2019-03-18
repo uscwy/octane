@@ -10,8 +10,8 @@ The secondary router waits only on UDP port to receive message from primary
 router.
 
 Topology:
-              IP Tunnel                   UDP
-tun interface <-------> primary router <--------> secondary router
+              IP Tunnel                  UDP                   RAW Socket
+tun interface <-------> primary router <------> secondary router <---->internet
 
 
   router.c      main program and primary and secondary router implementation
@@ -22,6 +22,20 @@ tun interface <-------> primary router <--------> secondary router
 REQUIREMENTS
 -------------
 Linux with tun support
+
+CRITICAL FUNCTIONS:
+--------------------
+router.c
+packet_input      handle input packet, searching flow table and deliver to the next
+handle_rawsocket  secondary router read packet from raw socket
+handle_internal   handle internal packets between routers
+handle_timer      handle timer event for retransimit queue
+rule_send         primary router send flow entry to secondary router
+rule_install      insert flow entry into local flow table
+find_flow_entry   search flow table for given pattern
+router_process    main loop of primary/secondary routers
+create_routers    fork child process for secondary routers
+get_conf          phrase configure file
 
 
 MAINTAINER
