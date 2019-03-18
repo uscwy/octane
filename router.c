@@ -25,7 +25,7 @@ struct config conf;
 int stage;
 int num_routers;
 int rid; /*router id*/
-int sockfd, tunfd, rawsockfd, timerfd;
+int sockfd, tunfd, rawsockfd, timerfd, tcpfd, udpfd;
 struct sockaddr_in addrs[MAX_ROUTERS];
 char buf[BUF_LEN];
 struct in_addr srcip;
@@ -502,7 +502,8 @@ void post_config_rule() {
 
 }
 int internal_send(void *p, int len, uint16_t port) {
-    struct packet *pkg=(struct packet *)buf;
+    char b[1600];
+    struct packet *pkg=(struct packet *)b;
     struct sockaddr_in addr;
 
     memset(&addr, 0, sizeof(addr));
@@ -529,7 +530,8 @@ int rawsocket_send(void *p, int len) {
         /*send reply to primary*/
         return internal_send(p, len, ntohs(addrs[0].sin_port));
     }
-    printf("raw send len=%d rid=%d\n",len,rid);
+    printf("raw send len=%d rid=%d, proto=%d\n",ip->ip_p,len,rid,rawsockfd);
+    printf("%s\n", inet_ntoa(ip->ip_dst));
     struct iovec iov[1];
     iov[0].iov_base = icmp;
     iov[0].iov_len = len-sizeof(struct ip);
@@ -547,7 +549,10 @@ int rawsocket_send(void *p, int len) {
     msg.msg_iov = &iov[0];
     msg.msg_iovlen = 1;
     /*send to raw socket*/
-    int ret = sendmsg(rawsockfd, &msg, 0);
+    int ret = 0;
+    if(ip->ip_p == IPPROTO_ICMP) ret = sendmsg(rawsockfd, &msg, 0);
+    else if(ip->ip_p == IPPROTO_TCP) ret = sendmsg(tcpfd, &msg, 0);
+    else if(ip->ip_p == IPPROTO_UDP) ret = sendmsg(udpfd, &msg, 0);
     return ret;
 }
 void distribute_rule(struct flow_entry *f) {
@@ -743,7 +748,7 @@ void handle_tun() {
 }
 
 /*read from udp socket*/
-void handle_udp() {
+void handle_internal() {
     static int counter = 0;
     struct packet *pkg = (struct packet *)buf;
     unsigned int op, id;
@@ -806,16 +811,16 @@ void handle_udp() {
 
 }
 /*packet handler for raw socket*/
-void handle_rawsocket() {
+void handle_rawsocket(int rawfd) {
     struct packet *pkg = (struct packet *)buf;
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
     int len;
     struct ip *ip = (struct ip *)pkg->data;
 
-    len = recvfrom(rawsockfd, pkg->data, BUF_LEN, MSG_DONTWAIT,
+    len = recvfrom(rawfd, pkg->data, BUF_LEN, MSG_DONTWAIT,
         (struct sockaddr *)&addr, &addrlen);
-
+    printf("recv %d len %d\n", rawfd, len);
     if(len < sizeof(struct ip)) {
         return;
     }
@@ -845,7 +850,10 @@ void send_hello() {
 
 }
 int raw_socket_bind() {
-    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    rawsockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    tcpfd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    udpfd = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+
     struct sockaddr_in addr;
     char ipaddr[32];
 
@@ -867,10 +875,18 @@ int raw_socket_bind() {
 	    printf("interface: %s rid=%d\n", inet_ntoa(addr.sin_addr),rid);
         close(sofd);
     }
-    if(bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    printf("fds %d,%d,%d\n", rawsockfd, tcpfd, udpfd);
+
+    if(bind(rawsockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         fprintf(stderr,"bind %s error - %s\n", ipaddr, strerror(errno));
     }
-    return sock;
+    if(bind(udpfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr,"bind %s error - %s\n", ipaddr, strerror(errno));
+    }
+    if(bind(tcpfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr,"bind %s error - %s\n", ipaddr, strerror(errno));
+    }
+    return rawsockfd;
 }
 
 /*router process, never return*/
@@ -904,6 +920,8 @@ int router_process() {
     if(tunfd > nfd) nfd = tunfd;
     if(rawsockfd > nfd) nfd = rawsockfd;
     if(timerfd > nfd) nfd = timerfd;
+    if(tcpfd > nfd) nfd = tcpfd;
+    if(udpfd > nfd) nfd = udpfd;
 
     nfd = nfd + 1;
 
@@ -912,7 +930,8 @@ int router_process() {
         if(rawsockfd > 0) FD_SET(rawsockfd, &fds);
         if(tunfd > 0) FD_SET(tunfd, &fds);
         if(timerfd > 0) FD_SET(timerfd, &fds);
-
+        if(udpfd > 0) FD_SET(udpfd, &fds);
+        if(tcpfd > 0) FD_SET(tcpfd, &fds);
 
         tv.tv_sec = MAX_IDLE_TIME;
         tv.tv_usec = 0;
@@ -920,16 +939,22 @@ int router_process() {
         ret = select(nfd, &fds, NULL, NULL, &tv);
                
         if(FD_ISSET(sockfd, &fds)) {
-            handle_udp();
+            handle_internal();
         }
         if(FD_ISSET(tunfd, &fds)) {
             handle_tun();
         }
         if(FD_ISSET(rawsockfd, &fds)) {
-            handle_rawsocket();
+            handle_rawsocket(rawsockfd);
         }
         if(FD_ISSET(timerfd, &fds)) {
             handle_timer();
+        }
+        if(FD_ISSET(udpfd, &fds)) {
+            handle_rawsocket(udpfd);
+        }
+        if(FD_ISSET(tcpfd, &fds)) {
+            handle_rawsocket(tcpfd);
         }
     } while(ret > 0 || rid > 0);
 
