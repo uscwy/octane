@@ -4,7 +4,7 @@ LDFLAGS=
 
 all: projb
 
-proja: router.o tun.o log.o
+projb: router.o tun.o log.o
 	$(CC) $^ $(LDFLAGS) -o $@
 
 %.o: %.c
