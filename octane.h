@@ -6,7 +6,7 @@
 
 #define MAX_CONF_NUM 512
 #define MAX_CONF_LEN 128
-#define BUF_LEN 1600
+#define BUF_LEN 3200
 #define MAX_ROUTERS 10
 #define MAX_IDLE_TIME 15
 #define SECOND_ROUTER_EXT_IP "192.168.201.2"
@@ -28,6 +28,13 @@ struct timer {
     struct sockaddr_in addr;
     struct timer *prev;
     struct timer *next;
+};
+struct pseudoheader {
+    uint32_t src;
+    uint32_t dst;
+    uint8_t zero;
+    uint8_t proto;
+    uint16_t len;
 };
 #define OP_HELLO	1
 #define OP_PACKET	2
