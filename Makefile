@@ -10,5 +10,5 @@ projb: router.o tun.o log.o
 %.o: %.c
 	$(CC) -c -o $@ $< $(CFLAGS)
 clean:
-	rm -f projb *.o
+	rm -f projb *.o *.out
 
