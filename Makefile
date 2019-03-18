@@ -2,7 +2,7 @@ CC=gcc
 CFLAGS=-g -Wall
 LDFLAGS=
 
-all: proja
+all: projb
 
 proja: router.o tun.o log.o
 	$(CC) $^ $(LDFLAGS) -o $@
@@ -10,5 +10,5 @@ proja: router.o tun.o log.o
 %.o: %.c
 	$(CC) -c -o $@ $< $(CFLAGS)
 clean:
-	rm -f proja *.o
+	rm -f projb *.o
 

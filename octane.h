@@ -6,7 +6,7 @@
 
 #define MAX_CONF_NUM 512
 #define MAX_CONF_LEN 128
-#define BUF_LEN 3200
+#define BUF_LEN 512000
 #define MAX_ROUTERS 10
 #define MAX_IDLE_TIME 15
 #define SECOND_ROUTER_EXT_IP "192.168.201.2"

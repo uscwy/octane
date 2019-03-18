@@ -65,9 +65,9 @@ int read_config(const char *fn) {
     char name[maxlen+1];
 
     if((fp = fopen(fn,"r")) == NULL) {
-            fprintf(stderr,"%s cannot be opened - %s\n",
-                            fn, strerror(errno));
-            return FAIL;
+        fprintf(stderr,"%s cannot be opened - %s\n",
+                        fn, strerror(errno));
+        return FAIL;
     }
     while(fgets(buf,maxlen, fp) != NULL) {
         int tmp;
@@ -98,7 +98,7 @@ int check_conf() {
         fprintf(stderr,"invalid stage %u\n", stage);
         return FAIL;
     }
-    if(stage > 4) {
+    if(stage > 3) {
         if(get_conf("drop_after", &drop_after) == FAIL 
                 || drop_after <= 0 || drop_after > 0x00ffffff) {
             fprintf(stderr, "invalid drop_after %u\n", drop_after);
@@ -247,8 +247,6 @@ struct timer *timer_resend(struct timer *t) {
         return NULL;
     }
     t->resend++;
-    //struct packet *pkg=(struct packet *)t->packet;
-    //struct octane_control *ctl=(struct octane_control *)pkg->data;
     sendto(t->sockfd, t->packet, t->len, 0, 
             (struct sockaddr *)&(t->addr), sizeof(struct sockaddr));
     return t;
@@ -521,8 +519,11 @@ unsigned short tcp_checksum(void *p, int len) {
     struct ip *ip=(struct ip *)p;
     struct tcphdr *tcp=(struct tcphdr *)(ip+1);
     uint16_t total_len = 0;
+    unsigned short ret;
 
-    char b[3200];
+    char *b = malloc(len+sizeof(struct pseudoheader));
+    if(b == NULL) return 0;
+
     struct pseudoheader hdr;
     hdr.src = ip->ip_src.s_addr;
     hdr.dst = ip->ip_dst.s_addr;
@@ -530,13 +531,15 @@ unsigned short tcp_checksum(void *p, int len) {
     hdr.proto = 6;
     hdr.len = htons(len - 20); /*tcp lenghth = len - iphdr*/
     
-    memcpy(&b[0], &hdr, sizeof(struct pseudoheader));
+    memcpy(b, &hdr, sizeof(struct pseudoheader));
     total_len = sizeof(struct pseudoheader);
     tcp->th_sum = 0;
-    memcpy(&b[total_len], tcp, len - 20);
+    memcpy(b+total_len, tcp, len - 20);
     total_len += len - 20;
+    ret = checksum(b, total_len);
+    free(b);
 
-    return checksum(&b[0], total_len);
+    return ret;
 }
 int rawsocket_send(void *p, int len) {
     struct ip *ip=(struct ip *)p;
@@ -564,14 +567,12 @@ int rawsocket_send(void *p, int len) {
     struct iovec iov[1];
     iov[0].iov_base = ip;
     iov[0].iov_len = len;
-    /*srcip = ip->ip_src;*/
     struct msghdr msg;
     struct sockaddr_in inaddr;
     memset(&inaddr, 0, sizeof(inaddr));
     inaddr.sin_family = AF_INET;
     inaddr.sin_addr = ip->ip_dst;
     memset(&msg, 0, sizeof(msg));
-    /*inaddr.sin_addr = ip->ip_dst;*/
     msg.msg_name = &inaddr;
     msg.msg_namelen = sizeof(inaddr);
     msg.msg_iov = &iov[0];
@@ -633,7 +634,7 @@ void distribute_rule(struct flow_entry *f) {
     }
     /*drop after N*/
     counter++;
-    if(stage > 4 && counter > drop_after) {
+    if(stage > 3 && counter > drop_after) {
         f->action = FLOW_ACT_DROP;
         counter = 0;
     }
@@ -660,7 +661,6 @@ void log_packet(void *p, uint16_t port) {
     struct ip *ip=(struct ip *)p;
     struct icmp *icmp=(struct icmp *)(ip+1);
     struct tcphdr *tcp=(struct tcphdr *)(ip+1);
-    struct udphdr *udp=(struct udphdr *)(ip+1);
 
     if(port == 0 && rid == 0) strcpy(from, "tunnel");
     else if(port == 0 && rid > 0) strcpy(from, "raw scok");
@@ -672,19 +672,10 @@ void log_packet(void *p, uint16_t port) {
             from, ipsrc, inet_ntoa(ip->ip_dst),
             icmp->icmp_type);
     }
-    else if(ip->ip_p == IPPROTO_TCP) {
+    if(ip->ip_p == IPPROTO_TCP && stage > 5) {
         log_print("TCP from %s, (%s, %hu, %s, %hu)\n",
             from, ipsrc, ntohs(tcp->th_sport), inet_ntoa(ip->ip_dst),
             ntohs(tcp->th_dport));
-    }
-    else if(ip->ip_p == IPPROTO_UDP) {
-        log_print("UDP from %s, (%s, %hu, %s, %hu)\n",
-            from, ipsrc, ntohs(udp->uh_sport), inet_ntoa(ip->ip_dst),
-            ntohs(udp->uh_dport));
-    }
-    else {
-        log_print("IP from %s, (%s, %s, %h)\n",
-            from, ipsrc, inet_ntoa(ip->ip_dst), ip->ip_p);
     }
 }
 int check_packet(void *p, int len) {
@@ -693,9 +684,7 @@ int check_packet(void *p, int len) {
     if(ip->ip_src.s_addr == 0 || ip->ip_dst.s_addr == 0)
         return -1;
 
-    if(ip->ip_p != IPPROTO_ICMP 
-       && ip->ip_p != IPPROTO_TCP 
-       && ip->ip_p != IPPROTO_UDP) {
+    if(ip->ip_p != IPPROTO_ICMP && ip->ip_p != IPPROTO_TCP) {
         return -1;
     }
     return 0;
@@ -706,7 +695,7 @@ void packet_input(char *p, int len, uint16_t port) {
     struct icmp *icmp=(struct icmp *)(ip+1);
     struct tcphdr *tcp=(struct tcphdr *)(ip+1);
     /*drop invalid ip packet*/
-    //if(check_packet(p,len)<0) return; 
+    if(check_packet(p,len)<0) return; 
 
     if(port>0) log_packet(p, port);
 
@@ -774,30 +763,31 @@ void packet_input(char *p, int len, uint16_t port) {
         internal_send(p, len, (flow->port));
     }
 }
-void handle_tun() {
+ssize_t handle_tun() {
     struct packet *pkg = (struct packet *)buf;
     pkg->op = OP_PACKET;
-    int len = tun_read(tunfd, pkg->data, BUF_LEN-HDR_LEN);
-    if(len <= 0) return;
+    ssize_t len = tun_read(tunfd, pkg->data, BUF_LEN-HDR_LEN);
+    if(len <= 0) return len;
     log_packet(pkg->data, 0);
     packet_input(pkg->data, len, 0);
+    return len;
 }
 
 /*read from udp socket*/
-void handle_internal() {
+ssize_t handle_internal() {
     static int counter = 0;
     struct packet *pkg = (struct packet *)buf;
     unsigned int op, id;
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
-    int len;
+    ssize_t len;
 
     len = recvfrom(sockfd, pkg, BUF_LEN, MSG_DONTWAIT,
         (struct sockaddr *)&addr, &addrlen);
 
 
     if(len < HDR_LEN) {
-        return;
+        return len;
     }
     op = ntohl(pkg->op);
     if(op == OP_HELLO) {
@@ -843,23 +833,23 @@ void handle_internal() {
             timer_recv_ack(ntohs(ctl->seqno));
         }
     }
-    return;
+    return len;
 
 }
 /*packet handler for raw socket*/
-void handle_rawsocket(int rawfd) {
+ssize_t handle_rawsocket(int rawfd) {
     struct packet *pkg = (struct packet *)buf;
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
-    int len;
+    ssize_t len = 1;
     struct ip *ip = (struct ip *)pkg->data;
     struct tcphdr *tcp = (struct tcphdr *)(ip+1);
 
-    len = recvfrom(rawfd, pkg->data, BUF_LEN, MSG_DONTWAIT,
+    len = recvfrom(rawfd, pkg->data, BUF_LEN-HDR_LEN, MSG_DONTWAIT,
         (struct sockaddr *)&addr, &addrlen);
 
-    if(len < sizeof(struct ip)) {
-        return;
+    if(len < sizeof(struct ip) || ip->ip_src.s_addr == ip->ip_dst.s_addr) {
+        return len;
     }
     log_packet(pkg->data, 0);
     
@@ -875,6 +865,8 @@ void handle_rawsocket(int rawfd) {
     }
 
     packet_input(pkg->data, len, 0);
+
+    return len;
 }
 void send_hello() {
     struct packet *hdr = (struct packet *)buf;
@@ -885,10 +877,6 @@ void send_hello() {
     int len = HDR_LEN + sizeof(struct pkg_hello);
     sendto(sockfd, hdr, len, 0, 
             (struct sockaddr *)&addrs[0], sizeof(addrs[0]));
-
-    /*fprintf(stderr,"rid=%d, sendto %s:%d\n",rid,
-            inet_ntoa(addrs[0].sin_addr),
-            htons(addrs[0].sin_port));*/
 
 }
 int raw_socket_bind() {
@@ -922,6 +910,7 @@ int raw_socket_bind() {
     if(setsockopt(tcpfd, IPPROTO_IP, IP_HDRINCL, &val, sizeof(val)) < 0) {
         fprintf(stderr,"setsockopt error\n");    
     }
+
     if(setsockopt(rawsockfd, IPPROTO_IP, IP_HDRINCL, &val, sizeof(val)) < 0) {
         fprintf(stderr,"setsockopt error\n");    
     }
