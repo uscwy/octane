@@ -76,6 +76,7 @@ struct flow_entry {
 #define FLOW_ACT_REPLY      2
 #define FLOW_ACT_DROP       3
 #define FLOW_ACT_REMOVE     4
+#define FLOW_ACT_AUTH       5
 
 #define MAX_FLOW_ENTRY 128
 #define HDR_LEN (sizeof(struct packet))

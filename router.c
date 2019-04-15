@@ -94,7 +94,7 @@ int check_conf() {
         return FAIL;
     }
     if(get_conf("stage",&stage) == FAIL || 
-            stage < 0 || stage > 7) {
+            stage < 0 || stage > 11) {
         fprintf(stderr,"invalid stage %u\n", stage);
         return FAIL;
     }
@@ -374,18 +374,70 @@ int is_flow_match(struct flow_entry *f1, struct flow_entry *f2) {
 }
 struct flow_entry *find_flow_entry(struct flow_entry *f) {
     for(int i=0;i<MAX_FLOW_ENTRY;i++) {
+        if(flow_table[i].action == FLOW_ACT_UNUSED)
+            continue;
         if(is_flow_match(&flow_table[i], f) == 1)
             return &flow_table[i];
     }
     return NULL;
 }
+void swap_src_dst(struct flow_entry *f) {
+    uint32_t tmpip = f->dst;
+    uint16_t tmpport = f->dport;
+    f->dst = f->src;
+    f->src = tmpip;
 
+    f->dport = f->sport;
+    f->sport = tmpport;
+}
 void print_flow_table() {
     printf("router id=%d\n", rid);
     for(int i=0;i<MAX_FLOW_ENTRY;i++) {
         if(flow_table[i].action != FLOW_ACT_UNUSED) 
             printf("%s\n", flow_to_str(&flow_table[i]));
     }
+}
+/*handle authenticated msg*/
+void rule_auth(struct flow_entry *f) {
+    struct flow_entry *entry=NULL;
+
+    /*replace the old rule*/
+    f->action = FLOW_ACT_FORWARD;
+    for(int i=0;i<MAX_FLOW_ENTRY;i++) {
+        if(flow_table[i].action == FLOW_ACT_UNUSED)
+            continue;
+        if(flow_table[i].src == f->src && flow_table[i].dport == f->dport 
+            && flow_table[i].proto == f->proto) {
+            entry = &flow_table[i];
+            break;
+        }
+    }
+    if(entry == NULL) {
+        fprintf(stderr,"cannot find auth entry, %s\n", flow_to_str(f));
+        return;
+    }
+    *entry = *f;
+    /*install rule to R1*/
+    f->port = 0; 
+    rule_install(f, 0, 1);
+
+    swap_src_dst(f);
+    entry = NULL;
+    /*replace the old rule*/
+    for(int i=0;i<MAX_FLOW_ENTRY;i++) {
+        if(flow_table[i].action == FLOW_ACT_UNUSED)
+            continue;
+        if(flow_table[i].dst == f->dst && flow_table[i].sport == f->sport 
+            && flow_table[i].proto == f->proto) {
+            entry = &flow_table[i];
+            break;
+        }
+    }
+    if(entry) *entry = *f;
+    /*install rule to R1*/
+    f->port = ntohs(addrs[0].sin_port); /*point to primary router*/
+    rule_install(f, 0, 1);
+   
 }
 void add_default_rule() {
     struct flow_entry f;
@@ -402,15 +454,6 @@ void add_default_rule() {
         rule_install(&f, -1, rid);
         return;
     } 
-}
-void swap_src_dst(struct flow_entry *f) {
-    uint32_t tmpip = f->dst;
-    uint16_t tmpport = f->dport;
-    f->dst = f->src;
-    f->src = tmpip;
-
-    f->dport = f->sport;
-    f->sport = tmpport;
 }
 int internal_send(void *p, int len, uint16_t port) {
     struct packet *pkg=(struct packet *)buf;
@@ -516,7 +559,7 @@ void distribute_rule(struct flow_entry *f) {
         if(ntohs(f->dport) == 80) target_rid = 1;
         else if(ntohs(f->dport) == 443) target_rid = 2;
     }
-    if(stage == 7 && f->proto == IPPROTO_TCP && ntohs(f->dport) == 443) {
+    else if(stage == 7 && f->proto == IPPROTO_TCP && ntohs(f->dport) == 443) {
         /*stage 7 policy, direct https to r1 and then r2*/
         f->port = ntohs(addrs[1].sin_port);
         rule_install(f, 0, 0); 
@@ -536,6 +579,21 @@ void distribute_rule(struct flow_entry *f) {
         f->port = ntohs(addrs[1].sin_port);
         return;
     }
+    else if(stage==8) {
+        if(ntohs(f->dport) == 80) target_rid = 1;
+        else if(ntohs(f->dport) == 443) target_rid = 2; 
+    }
+    else if(stage==9) {
+        /*redirect http to r3 for authentication*/
+        if(ntohs(f->dport) == 80) target_rid = 3;
+        else if(ntohs(f->dport) == 443) target_rid = 2; 
+    }
+    else if(stage==10) {
+        /*odd sport goto r1, even goto r2*/
+        if(ntohs(f->sport) % 2 == 1) target_rid = 1;
+        else target_rid = 2; 
+    }
+     
     f->port = ntohs(addrs[target_rid].sin_port); /*point to target router*/
     rule_install(f, 0, 0); /*install on primary*/
 
@@ -684,7 +742,21 @@ ssize_t handle_tun() {
     packet_input(pkg->data, len, 0);
     return len;
 }
-
+/*write /tmp/captive.conf 
+R0:port_number
+R1:port_number*/
+void write_captive_conf() {
+    FILE *fp = fopen("/tmp/captive.conf","w");
+    if(fp == NULL) {
+        fprintf(stderr,"cannot open /tmp/captive.conf\n");
+        return;
+    }
+    fprintf(fp, "R0:%d\n", ntohs(addrs[0].sin_port));
+    fprintf(fp, "R1:%d\n", ntohs(addrs[1].sin_port));
+    fclose(fp);
+    return;
+    
+}
 /*read from udp socket*/
 ssize_t handle_internal() {
     static int counter = 0;
@@ -710,6 +782,7 @@ ssize_t handle_internal() {
             memcpy(&addrs[id], &addr, sizeof(addr));
             log_print("router: %d, pid: %d, port: %d\n",
                 id, ntohl(p->pid), ntohs(addrs[id].sin_port));
+	    if(id==1) write_captive_conf();
         }
         counter++;
         if(counter == num_routers) {
@@ -735,7 +808,10 @@ ssize_t handle_internal() {
         f.proto = ctl->protocol;
         f.port = ntohs(ctl->port);
 
-        if(ctl->flags == 0) {
+        if(ctl->flags == 0 && ctl->action == FLOW_ACT_AUTH) {
+            rule_auth(&f);
+        }
+        else if(ctl->flags == 0) {
             /*receive new rule from primary router*/
             rule_install(&f, 0, rid);
             ctl->flags = 1; /*send ack*/
@@ -743,6 +819,21 @@ ssize_t handle_internal() {
         } else {
             /*receive ack from secondary router*/
             timer_recv_ack(ntohs(ctl->seqno));
+        }
+    }
+    else {
+        struct ip *ip = (struct ip *)pkg;
+        if(len == sizeof(struct octane_control)+20 && ip->ip_p == 253) {
+            struct octane_control *ctl = (struct octane_control *)(ip + 1);
+            struct flow_entry f;
+            f.action = ctl->action;
+            f.src = htonl(ctl->source_ip);
+            f.dst = htonl(ctl->dest_ip);
+            f.sport = htons(ctl->source_port);
+            f.dport = ctl->dest_port;
+            f.proto = ctl->protocol;
+            f.port = ctl->port;
+            if(f.action == FLOW_ACT_AUTH) rule_auth(&f);
         }
     }
     return len;
