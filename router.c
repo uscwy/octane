@@ -416,7 +416,11 @@ void rule_auth(struct flow_entry *f) {
         fprintf(stderr,"cannot find auth entry, %s\n", flow_to_str(f));
         return;
     }
-    *entry = *f;
+    /*delete old rule on R0*/
+    entry->action = FLOW_ACT_UNUSED;
+    /*install rule on R0*/
+    rule_install(f, 0, 0);
+
     /*install rule to R1*/
     f->port = 0; 
     rule_install(f, 0, 1);
@@ -433,7 +437,9 @@ void rule_auth(struct flow_entry *f) {
             break;
         }
     }
-    if(entry) *entry = *f;
+    if(entry) entry->action = FLOW_ACT_UNUSED;
+    /*install rule on R0*/
+    rule_install(f, 0, 0);
     /*install rule to R1*/
     f->port = ntohs(addrs[0].sin_port); /*point to primary router*/
     rule_install(f, 0, 1);
