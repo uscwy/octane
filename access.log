@@ -1,0 +1,4 @@
+1555999489.036   7107 192.168.201.2 TCP_MISS/200 27555 GET http://wireless.csail.mit.edu/ - ORIGINAL_DST/128.52.130.149 text/html
+1555999495.470      0 192.168.201.2 TCP_MEM_HIT/200 27561 GET http://wireless.csail.mit.edu/ - HIER_NONE/- text/html
+1555999497.580      0 192.168.201.2 TCP_MEM_HIT/200 27561 GET http://wireless.csail.mit.edu/ - HIER_NONE/- text/html
+1555999499.486      0 192.168.201.2 TCP_MEM_HIT/200 27562 GET http://wireless.csail.mit.edu/ - HIER_NONE/- text/html
